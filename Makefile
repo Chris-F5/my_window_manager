@@ -1,8 +1,8 @@
 OUTPUT = mwm
 CC = gcc
 LDFLAGS = -lxcb -lxcb-keysyms
-SRC = my_window_manager.c decoration.c
-HEADERS = my_window_manager.h
+SRC = my_window_manager.c decoration.c xconnection.c
+HEADERS = my_window_manager.h xconnection.h
 OBJS = $(SRC:.c=.o)
 
 $(OUTPUT): $(OBJS)

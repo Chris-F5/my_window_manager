@@ -8,6 +8,7 @@
 #include <xcb/xcb_keysyms.h>
 
 #include "./decoration.h"
+#include "./xconnection.h"
 
 #define MAX_EVENT_CODE 34
 
@@ -18,32 +19,30 @@ typedef struct {
 
 typedef struct {
     unsigned int mod;
-    xcb_keysym_t keySym;
+    xcb_keysym_t keysym;
     void (*func)(void);
 } KeyboardShortcut;
 
 void spawn(char** args);
 void menu(void);
-void configureRequest(xcb_generic_event_t* genericEvent);
-void mapRequest(xcb_generic_event_t* genericEvent);
-void keyPress(xcb_generic_event_t* genericEvent);
-void expose(xcb_generic_event_t* genericEvent);
+void configureRequest(XConnection* x, xcb_generic_event_t* genericEvent);
+void mapRequest(XConnection* x, xcb_generic_event_t* genericEvent);
+void keyPress(XConnection* x, xcb_generic_event_t* genericEvent);
+void expose(XConnection* x, xcb_generic_event_t* genericEvent);
 
-static xcb_connection_t* con;
-static xcb_screen_t* screen;
-static const xcb_setup_t* setup;
-static Font font;
-static Decoration testDecoration;
-static int quit = 0;
 static KeyboardShortcut keyShortcuts[] = {
     {XCB_MOD_MASK_1, 0xff0d, menu}
 };
-static void (*eventHandlers[MAX_EVENT_CODE + 1])(xcb_generic_event_t*) = {
+static void (*eventHandlers[MAX_EVENT_CODE + 1])(XConnection*, xcb_generic_event_t*) = {
     [XCB_KEY_PRESS] = keyPress,
     [XCB_EXPOSE] = expose,
     [XCB_MAP_REQUEST] = mapRequest,
     [XCB_CONFIGURE_REQUEST] = configureRequest,
 };
+
+static Decoration testDecoration;
+static Font font;
+static int quit = 0;
 
 void spawn(char** args)
 {
@@ -61,7 +60,7 @@ void menu(void)
     spawn(args);
 }
 
-void configureRequest(xcb_generic_event_t* genericEvent)
+void configureRequest(XConnection* x, xcb_generic_event_t* genericEvent)
 {
     xcb_configure_request_event_t* event 
         = (xcb_configure_request_event_t*)genericEvent;
@@ -82,117 +81,79 @@ void configureRequest(xcb_generic_event_t* genericEvent)
         event->sibling,
         event->stack_mode,
     };
-    xcb_configure_window(con, screen->root, mask, values);
+    xcb_configure_window(x->con, x->screen->root, mask, values);
     printf("configured window %d %d %d %d\n", event->x, event->y, event->width, event->height);
-    xcb_flush(con);
+    xcb_flush(x->con);
 }
 
-void mapRequest(xcb_generic_event_t* genericEvent)
+void mapRequest(XConnection* x, xcb_generic_event_t* genericEvent)
 {
     xcb_map_request_event_t* event = (xcb_map_request_event_t*)genericEvent;
-    xcb_map_window(con, event->window);
-    xcb_flush(con);
+    xcb_map_window(x->con, event->window);
+    xcb_flush(x->con);
 }
 
-void keyPress(xcb_generic_event_t* genericEvent)
+void keyPress(XConnection* x, xcb_generic_event_t* genericEvent)
 {
-    printf("key\n");
-    xcb_key_press_event_t* event = (xcb_key_press_event_t*)genericEvent;
+    xcb_key_press_event_t* event;
+    xcb_keysym_t keysym;
 
-    xcb_key_symbols_t* symbols = xcb_key_symbols_alloc(con);
-    xcb_keysym_t keySym;
-    keySym = symbols 
-        ? xcb_key_symbols_get_keysym(symbols, event->detail, 0) 
-        : 0;
-    xcb_key_symbols_free(symbols);
+    event = (xcb_key_press_event_t*)genericEvent;
+    keysym = XConnection_keycodeToKeysym(x, event->detail);
 
     for(int i = 0; i < sizeof(keyShortcuts) / sizeof(keyShortcuts[0]); i++) {
         if(keyShortcuts[i].mod == event->state 
-        && keyShortcuts[i].keySym == keySym) {
-            printf("KEY ACCEPT\n");
+        && keyShortcuts[i].keysym == keysym) {
             keyShortcuts[i].func();
         }
     }
 }
 
-void expose(xcb_generic_event_t* genericEvent)
+void expose(XConnection* x, xcb_generic_event_t* genericEvent)
 {
-    Decoration_expose(&testDecoration, con, screen);
-    xcb_flush(con);
+    Decoration_expose(&testDecoration, x->con, x->screen);
+    xcb_flush(x->con);
 }
 
 int main()
 {
-    int conErr, i, screenNum;
-    xcb_screen_iterator_t screenIter;
-    xcb_void_cookie_t cookie;
+    XConnection x;
+    XCursor cursor;
+    xcb_keycode_t keycode;
 
-    /* CONNECT */
-    con = xcb_connect(NULL, &screenNum);
-    if((conErr = xcb_connection_has_error(con))) {
-        fprintf(
-            stderr,
-            "failed to connect to x server. error code %d\n",
-            conErr);
-        exit(1);
-    }
+    XConnection_init(&x);
 
-    /* SETUP */
-    setup = xcb_get_setup(con);
-    screenIter = xcb_setup_roots_iterator(setup);
-    for(i = 0; i < screenNum; i++)
-        xcb_screen_next(&screenIter);
-    screen = screenIter.data;
-    xcb_ungrab_key(con, XCB_GRAB_ANY, screen->root, XCB_MOD_MASK_ANY);
+    xcb_ungrab_key(x.con, XCB_GRAB_ANY, x.screen->root, XCB_MOD_MASK_ANY);
     for(int i = 0; i < sizeof(keyShortcuts) / sizeof(keyShortcuts[i]); i++) {
-        xcb_key_symbols_t* keySyms;
-        xcb_keycode_t* keycode;
-        keySyms = xcb_key_symbols_alloc(con);
-        keycode = keySyms 
-            ? xcb_key_symbols_get_keycode(keySyms, keyShortcuts[i].keySym)
-            : NULL;
-        xcb_key_symbols_free(keySyms);
-        if(keycode == NULL) {
+        keycode = XConnection_keysymToKeycode(&x, keyShortcuts[i].keysym);
+        if(keycode == 0) {
             fprintf(stderr, "failed to register key shortcut\n");
         } else {
             xcb_grab_key(
-                con,
+                x.con,
                 1,
-                screen->root,
+                x.screen->root,
                 keyShortcuts[i].mod,
-                *keycode,
+                keycode,
                 XCB_GRAB_MODE_ASYNC,
                 XCB_GRAB_MODE_ASYNC);
         }
     }
 
-    /* CURSOR */
-    xcb_font_t cursorFont = xcb_generate_id(con);
-    xcb_open_font(con, cursorFont, strlen("cursor"), "cursor");
-
-    xcb_cursor_t cursor = xcb_generate_id(con);
-    xcb_create_glyph_cursor(
-        con,
-        cursor,
-        cursorFont,
-        cursorFont, 
-        58,
-        58 + 1,
-        0, 0, 0,
-        0, 0, 0);
+    XCursor_init(&cursor, &x);
 
     /* DECORATION */
-    Font_init(&font, con, "fixed");
-    Decoration_init(&testDecoration, con, screen, 400, 600, 800, 200);
-    Decoration_drawRect(&testDecoration, con, 0, 0, 800, 200, screen->white_pixel);
+    Font_init(&font, x.con, "fixed");
+    Decoration_init(&testDecoration, x.con, x.screen, 400, 600, 800, 200);
+    Decoration_drawRect(&testDecoration, x.con, 0, 0, 800, 200, x.screen->white_pixel);
     Decoration_drawText(
         &testDecoration,
-        con,
+        x.con,
         0, 0,
         "Hiy AAAAAAA",
         &font,
-        screen->white_pixel,
-        screen->black_pixel);
+        x.screen->white_pixel,
+        x.screen->black_pixel);
 
     /* WINDOW ATTRIBS */
     uint32_t values[] = {
@@ -202,13 +163,14 @@ int main()
         | XCB_EVENT_MASK_KEY_PRESS
         | XCB_EVENT_MASK_EXPOSURE
     };
+    xcb_void_cookie_t cookie;
     cookie = xcb_change_window_attributes_checked(
-        con,
-        screen->root,
+        x.con,
+        x.screen->root,
         XCB_CW_EVENT_MASK,
         values);
     xcb_generic_error_t* err;
-    if((err = xcb_request_check(con, cookie))) {
+    if((err = xcb_request_check(x.con, cookie))) {
         if(err->error_code == XCB_ACCESS) {
             fprintf(stderr, "failed to register for events. denied access. \
 maybe another window manager is running?\n");
@@ -219,21 +181,22 @@ maybe another window manager is running?\n");
                 err->error_code);
         }
         free(err);
-        xcb_disconnect(con);
+        xcb_disconnect(x.con);
         exit(1);
     }
-    xcb_flush(con);
+    xcb_flush(x.con);
 
     /* EVENT LOOP */
     while(quit == 0) {
-        if((conErr = xcb_connection_has_error(con))) {
+        int conErr;
+        if((conErr = xcb_connection_has_error(x.con))) {
             fprintf(
                 stderr,
                 "x server connection unexpectedly closed. error code %d\n",
                 conErr);
             exit(1);
         }
-        xcb_generic_event_t* event = xcb_wait_for_event(con);
+        xcb_generic_event_t* event = xcb_wait_for_event(x.con);
 
         unsigned char eventCode = event->response_type & ~0x80;
         if(eventCode > MAX_EVENT_CODE)
@@ -241,14 +204,15 @@ maybe another window manager is running?\n");
             fprintf(stderr, "received event code greater than MAX_EVENT_CODE");
             eventCode = 0;
         }
-        void (*handlerFunc)(xcb_generic_event_t*) = eventHandlers[eventCode];
+        void (*handlerFunc)(XConnection*, xcb_generic_event_t*) = eventHandlers[eventCode];
         if(handlerFunc)
-            handlerFunc(event);
+            handlerFunc(&x, event);
     }
 
     /* CLEANUP */
-    xcb_free_cursor(con, cursor);
-    xcb_disconnect(con);
+
+    XCursor_destroy(&cursor, &x);
+    XConnection_destroy(&x);
 
     return 0;
 }
