@@ -6,6 +6,9 @@
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
 #include <xcb/xcb_keysyms.h>
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
 
 #include "./decoration.h"
 #include "./xconnection.h"
@@ -23,16 +26,11 @@ typedef struct {
     void (*func)(void);
 } KeyboardShortcut;
 
-void spawn(char** args);
-void menu(void);
 void configureRequest(XConnection* x, xcb_generic_event_t* genericEvent);
 void mapRequest(XConnection* x, xcb_generic_event_t* genericEvent);
 void keyPress(XConnection* x, xcb_generic_event_t* genericEvent);
 void expose(XConnection* x, xcb_generic_event_t* genericEvent);
 
-static KeyboardShortcut keyShortcuts[] = {
-    {XCB_MOD_MASK_1, 0xff0d, menu}
-};
 static void (*eventHandlers[MAX_EVENT_CODE + 1])(XConnection*, xcb_generic_event_t*) = {
     [XCB_KEY_PRESS] = keyPress,
     [XCB_EXPOSE] = expose,
@@ -40,6 +38,7 @@ static void (*eventHandlers[MAX_EVENT_CODE + 1])(XConnection*, xcb_generic_event
     [XCB_CONFIGURE_REQUEST] = configureRequest,
 };
 
+static lua_State* luaState;
 static Decoration testDecoration;
 static Font font;
 static int quit = 0;
@@ -54,10 +53,39 @@ void spawn(char** args)
     }
 }
 
-void menu(void)
+int l_spawn(lua_State* luaState)
 {
-    char* args[] = {"dmenu_run", NULL};
-    spawn(args);
+    int tableLen, i;
+    char** spawnArgs;
+    size_t strLen;
+    char* str;
+
+    if(!lua_istable(luaState, 1)) {
+        luaL_error(luaState, "spawn takes a table as an argument");
+        return 0;
+    }
+    
+    tableLen = 0;
+    lua_pushnil(luaState); /* push first key */
+    /* pop key; push next key and value */
+    while(lua_next(luaState, 1)) {
+        tableLen++;
+        lua_pop(luaState, 1); /* pop value */
+    }
+
+    spawnArgs = malloc((tableLen + 1) * sizeof(char*));
+    i = 0;
+    lua_pushnil(luaState); /* push first key */
+    /* pop key; push next key and value */
+    while(lua_next(luaState, 1)) {
+        str = (char*)lua_tolstring(luaState, -1, &strLen);
+        spawnArgs[i++] = str;
+        lua_pop(luaState, 1); /* pop value */
+    }
+    spawnArgs[i] = NULL;
+    spawn(spawnArgs);
+
+    return 0;
 }
 
 void configureRequest(XConnection* x, xcb_generic_event_t* genericEvent)
@@ -96,17 +124,42 @@ void mapRequest(XConnection* x, xcb_generic_event_t* genericEvent)
 void keyPress(XConnection* x, xcb_generic_event_t* genericEvent)
 {
     xcb_key_press_event_t* event;
-    xcb_keysym_t keysym;
+    xcb_keysym_t eventKeysym;
+    int keysModFlags, keysKeySym;
 
     event = (xcb_key_press_event_t*)genericEvent;
-    keysym = XConnection_keycodeToKeysym(x, event->detail);
+    eventKeysym = XConnection_keycodeToKeysym(x, event->detail);
 
-    for(int i = 0; i < sizeof(keyShortcuts) / sizeof(keyShortcuts[0]); i++) {
-        if(keyShortcuts[i].mod == event->state 
-        && keyShortcuts[i].keysym == keysym) {
-            keyShortcuts[i].func();
+    lua_getglobal(luaState, "keys"); /* push keys table */
+    if(lua_istable(luaState, -1) == 0)
+        return;
+
+    lua_pushnil(luaState); /* push first key */
+    /* pop key; push next key and value */
+    while(lua_next(luaState, -2)) {
+        lua_pushinteger(luaState, 1); /* push table index */
+        lua_gettable(luaState, -2); /* pop table index; push mod flags */
+        keysModFlags = lua_tointeger(luaState, -1);
+        lua_pop(luaState, 1); /* pop mod flags */
+
+        lua_pushinteger(luaState, 2); /* push table index */
+        lua_gettable(luaState, -2); /* pop table index; push keysym */
+        keysKeySym = lua_tointeger(luaState, -1);
+        lua_pop(luaState, 1); /* pop keysym */
+
+        if(event->state == keysModFlags && eventKeysym == keysKeySym) {
+            lua_pushinteger(luaState, 3); /* push table index */
+            lua_gettable(luaState, -2); /* pop table index; push lua function */
+            if(lua_isfunction(luaState, -1))
+                lua_call(luaState, 0, 0); /* pop and call lua function */
+            else
+                lua_pop(luaState, 1); /* pop invalid function */
         }
+
+        lua_pop(luaState, 1); /* pop value */
     }
+
+    lua_pop(luaState, 1); /* pop keys table */
 }
 
 void expose(XConnection* x, xcb_generic_event_t* genericEvent)
@@ -120,25 +173,28 @@ int main()
     XConnection x;
     XCursor cursor;
     xcb_keycode_t keycode;
+    int luaError;
+
+    luaState = luaL_newstate();
+    luaL_openlibs(luaState);
+    lua_register(luaState, "spawn", l_spawn);
+    luaError = luaL_dofile(luaState, "mwmrc.lua");
+    if(luaError != LUA_OK) {
+        fprintf(stderr, "[LUA ERROR]: %s\n", lua_tostring(luaState, -1));
+        lua_pop(luaState, 1);
+    }
 
     XConnection_init(&x);
 
     xcb_ungrab_key(x.con, XCB_GRAB_ANY, x.screen->root, XCB_MOD_MASK_ANY);
-    for(int i = 0; i < sizeof(keyShortcuts) / sizeof(keyShortcuts[i]); i++) {
-        keycode = XConnection_keysymToKeycode(&x, keyShortcuts[i].keysym);
-        if(keycode == 0) {
-            fprintf(stderr, "failed to register key shortcut\n");
-        } else {
-            xcb_grab_key(
-                x.con,
-                1,
-                x.screen->root,
-                keyShortcuts[i].mod,
-                keycode,
-                XCB_GRAB_MODE_ASYNC,
-                XCB_GRAB_MODE_ASYNC);
-        }
-    }
+    xcb_grab_key(
+        x.con,
+        1,
+        x.screen->root,
+        XCB_MOD_MASK_1,
+        XCB_GRAB_ANY,
+        XCB_GRAB_MODE_ASYNC,
+        XCB_GRAB_MODE_ASYNC);
 
     XCursor_init(&cursor, &x);
 
@@ -210,9 +266,10 @@ maybe another window manager is running?\n");
     }
 
     /* CLEANUP */
-
     XCursor_destroy(&cursor, &x);
     XConnection_destroy(&x);
+
+    lua_close(luaState);
 
     return 0;
 }
