@@ -10,8 +10,11 @@
 #include <lauxlib.h>
 #include <lualib.h>
 
+#define XK_MISCELLANY
+#define XK_LATIN1
+#include <X11/keysymdef.h>
+
 #include "./decoration.h"
-#include "./xconnection.h"
 
 #define MAX_EVENT_CODE 34
 
@@ -20,78 +23,65 @@ typedef struct {
     int winX, winY, winW, winH;
 } Monitor;
 
+typedef union {
+    char** v;
+} ShortcutArg;
+
 typedef struct {
     unsigned int mod;
     xcb_keysym_t keysym;
-    void (*func)(void);
+    void (*func)(ShortcutArg);
+    ShortcutArg arg;
 } KeyboardShortcut;
 
-void configureRequest(XConnection* x, xcb_generic_event_t* genericEvent);
-void mapRequest(XConnection* x, xcb_generic_event_t* genericEvent);
-void keyPress(XConnection* x, xcb_generic_event_t* genericEvent);
-void expose(XConnection* x, xcb_generic_event_t* genericEvent);
+typedef struct {
+    xcb_connection_t* xcon;
+    xcb_screen_t* screen;
+    xcb_font_t cursorFont;
+    xcb_cursor_t cursor;
+    int screenNum, quit;
+    xcb_keycode_t minKeycode, maxKeycode;
+    xcb_keysym_t* keymap;
+    Font font;
+    Decoration testDecor;
+} WMCtx;
 
-static void (*eventHandlers[MAX_EVENT_CODE + 1])(XConnection*, xcb_generic_event_t*) = {
+void spawn(ShortcutArg arg);
+void configureRequest(WMCtx* ctx, xcb_generic_event_t* genericEvent);
+void mapRequest(WMCtx* ctx, xcb_generic_event_t* genericEvent);
+void keyPress(WMCtx* ctx, xcb_generic_event_t* genericEvent);
+void expose(WMCtx* ctx, xcb_generic_event_t* genericEvent);
+
+static void (*eventHandlers[MAX_EVENT_CODE + 1])(WMCtx* ctx, xcb_generic_event_t*) = {
     [XCB_KEY_PRESS] = keyPress,
     [XCB_EXPOSE] = expose,
     [XCB_MAP_REQUEST] = mapRequest,
     [XCB_CONFIGURE_REQUEST] = configureRequest,
 };
 
-static lua_State* luaState;
-static Decoration testDecoration;
-static Font font;
-static int quit = 0;
+static char* menuArgs[] = {"dmenu_run", NULL};
+#define INCLUDE_MOD_KEYS (XCB_MOD_MASK_1 | XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)
+#define MOD_KEY XCB_MOD_MASK_1
 
-void spawn(char** args)
+static KeyboardShortcut keys[] = {
+    {MOD_KEY, XK_p, spawn, menuArgs}
+};
+
+void spawn(ShortcutArg arg)
 {
     if(fork() == 0)
     {
         setsid();
-        execvp(args[0], args);
+        execvp(arg.v[0], arg.v);
         exit(0);
     }
 }
 
-int l_spawn(lua_State* luaState)
-{
-    int tableLen, i;
-    char** spawnArgs;
-    size_t strLen;
-    char* str;
-
-    if(!lua_istable(luaState, 1)) {
-        luaL_error(luaState, "spawn takes a table as an argument");
-        return 0;
-    }
-    
-    tableLen = 0;
-    lua_pushnil(luaState); /* push first key */
-    /* pop key; push next key and value */
-    while(lua_next(luaState, 1)) {
-        tableLen++;
-        lua_pop(luaState, 1); /* pop value */
-    }
-
-    spawnArgs = malloc((tableLen + 1) * sizeof(char*));
-    i = 0;
-    lua_pushnil(luaState); /* push first key */
-    /* pop key; push next key and value */
-    while(lua_next(luaState, 1)) {
-        str = (char*)lua_tolstring(luaState, -1, &strLen);
-        spawnArgs[i++] = str;
-        lua_pop(luaState, 1); /* pop value */
-    }
-    spawnArgs[i] = NULL;
-    spawn(spawnArgs);
-
-    return 0;
-}
-
-void configureRequest(XConnection* x, xcb_generic_event_t* genericEvent)
+void configureRequest(WMCtx* ctx, xcb_generic_event_t* genericEvent)
 {
     xcb_configure_request_event_t* event 
         = (xcb_configure_request_event_t*)genericEvent;
+
     uint16_t mask
         = XCB_CONFIG_WINDOW_X
         | XCB_CONFIG_WINDOW_Y
@@ -109,167 +99,249 @@ void configureRequest(XConnection* x, xcb_generic_event_t* genericEvent)
         event->sibling,
         event->stack_mode,
     };
-    xcb_configure_window(x->con, x->screen->root, mask, values);
+
+    xcb_configure_window(ctx->xcon, ctx->screen->root, mask, values);
     printf("configured window %d %d %d %d\n", event->x, event->y, event->width, event->height);
-    xcb_flush(x->con);
+    xcb_flush(ctx->xcon);
 }
 
-void mapRequest(XConnection* x, xcb_generic_event_t* genericEvent)
+void mapRequest(WMCtx* ctx, xcb_generic_event_t* genericEvent)
 {
     xcb_map_request_event_t* event = (xcb_map_request_event_t*)genericEvent;
-    xcb_map_window(x->con, event->window);
-    xcb_flush(x->con);
+    xcb_map_window(ctx->xcon, event->window);
+    xcb_flush(ctx->xcon);
 }
 
-void keyPress(XConnection* x, xcb_generic_event_t* genericEvent)
+void keyPress(WMCtx* ctx, xcb_generic_event_t* genericEvent)
 {
     xcb_key_press_event_t* event;
     xcb_keysym_t eventKeysym;
-    int keysModFlags, keysKeySym;
+    int i;
 
     event = (xcb_key_press_event_t*)genericEvent;
-    eventKeysym = XConnection_keycodeToKeysym(x, event->detail);
-
-    lua_getglobal(luaState, "keys"); /* push keys table */
-    if(lua_istable(luaState, -1) == 0)
+    if(event->detail < ctx->minKeycode || event->detail > ctx->maxKeycode)
         return;
+    eventKeysym =  ctx->keymap[event->detail - ctx->minKeycode];
 
-    lua_pushnil(luaState); /* push first key */
-    /* pop key; push next key and value */
-    while(lua_next(luaState, -2)) {
-        lua_pushinteger(luaState, 1); /* push table index */
-        lua_gettable(luaState, -2); /* pop table index; push mod flags */
-        keysModFlags = lua_tointeger(luaState, -1);
-        lua_pop(luaState, 1); /* pop mod flags */
+    printf("keypress %d %d\n", event->state, eventKeysym);
 
-        lua_pushinteger(luaState, 2); /* push table index */
-        lua_gettable(luaState, -2); /* pop table index; push keysym */
-        keysKeySym = lua_tointeger(luaState, -1);
-        lua_pop(luaState, 1); /* pop keysym */
-
-        if(event->state == keysModFlags && eventKeysym == keysKeySym) {
-            lua_pushinteger(luaState, 3); /* push table index */
-            lua_gettable(luaState, -2); /* pop table index; push lua function */
-            if(lua_isfunction(luaState, -1))
-                lua_call(luaState, 0, 0); /* pop and call lua function */
-            else
-                lua_pop(luaState, 1); /* pop invalid function */
+    event->state &= INCLUDE_MOD_KEYS;
+    for(i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        printf("%x %x | %x %x\n", event->state, keys[i].mod, eventKeysym, keys[i].keysym);
+        if(event->state == keys[i].mod && eventKeysym == keys[i].keysym) {
+            printf("b\n");
+            keys[i].func(keys[i].arg);
         }
-
-        lua_pop(luaState, 1); /* pop value */
     }
-
-    lua_pop(luaState, 1); /* pop keys table */
 }
 
-void expose(XConnection* x, xcb_generic_event_t* genericEvent)
+void expose(WMCtx* ctx, xcb_generic_event_t* genericEvent) {
+    Decoration_expose(&ctx->testDecor, ctx->xcon, ctx->screen);
+    xcb_flush(ctx->xcon);
+}
+
+static void initCtx(WMCtx* ctx)
 {
-    Decoration_expose(&testDecoration, x->con, x->screen);
-    xcb_flush(x->con);
+    /* connect to x11 */
+    {
+        int conErr;
+        /* use DISPLAY enviroment varable for screen number */
+        ctx->xcon = xcb_connect(NULL, &ctx->screenNum);
+        if((conErr = xcb_connection_has_error(ctx->xcon))) {
+            fprintf(
+                stderr,
+                "failed to connect to x server. error code %d\n",
+                conErr);
+            exit(1);
+        }
+    }
+
+    /* find screen */
+    {
+        const xcb_setup_t* setup;
+        xcb_screen_iterator_t screenIter;
+        int i;
+
+        setup = xcb_get_setup(ctx->xcon);
+
+        screenIter = xcb_setup_roots_iterator(setup);
+        for(i = 0; i < ctx->screenNum; i++)
+            xcb_screen_next(&screenIter);
+        ctx->screen = screenIter.data;
+
+        ctx->minKeycode = setup->min_keycode;
+        ctx->maxKeycode = setup->max_keycode;
+    }
+
+    /* keymap */
+    {
+        xcb_get_keyboard_mapping_cookie_t cookie;
+        xcb_generic_error_t* error;
+        xcb_get_keyboard_mapping_reply_t* reply;
+        int keycodeCount, i;
+
+        keycodeCount = ctx->maxKeycode - ctx->minKeycode + 1;
+        cookie = xcb_get_keyboard_mapping(
+            ctx->xcon,
+            ctx->minKeycode,
+            keycodeCount);
+        reply = xcb_get_keyboard_mapping_reply(
+            ctx->xcon,
+            cookie,
+            &error);
+
+        if(reply == NULL) {
+            fprintf(
+                stderr,
+                "failed to get keyboard mapping (%d)\n",
+                error->error_code);
+            free(error);
+            exit(1);
+        }
+
+        xcb_keysym_t* replyKeymap = xcb_get_keyboard_mapping_keysyms(reply);
+        ctx->keymap = malloc(keycodeCount * sizeof(xcb_keysym_t));
+        for(i = 0; i < keycodeCount; i++) {
+            ctx->keymap[i] = replyKeymap[i * reply->keysyms_per_keycode];
+        }
+
+        free(reply);
+    }
+
+    /* cursor */
+    {
+        ctx->cursorFont = xcb_generate_id(ctx->xcon);
+        xcb_open_font(ctx->xcon, ctx->cursorFont, strlen("cursor"), "cursor");
+
+        ctx->cursor = xcb_generate_id(ctx->xcon);
+        xcb_create_glyph_cursor(
+            ctx->xcon,
+            ctx->cursor,
+            ctx->cursorFont,
+            ctx->cursorFont, 
+            58,
+            58 + 1,
+            0, 0, 0,
+            0, 0, 0);
+    }
+
+    /* decoration */
+    {
+        Font_init(&ctx->font, ctx->xcon, "fixed");
+        Decoration_init(&ctx->testDecor, ctx->xcon, ctx->screen, 400, 600, 800, 200);
+        Decoration_drawRect(&ctx->testDecor, ctx->xcon, 0, 0, 800, 200, ctx->screen->white_pixel);
+        Decoration_drawText(
+            &ctx->testDecor,
+            ctx->xcon,
+            0, 0,
+            "Hiy AAAAAAA",
+            &ctx->font,
+            ctx->screen->white_pixel,
+            ctx->screen->black_pixel);
+    }
+
+    /* events */
+    {
+        xcb_void_cookie_t cookie;
+        xcb_generic_error_t* err;
+        uint32_t values[] = {
+            XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT
+            | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY
+            | XCB_EVENT_MASK_STRUCTURE_NOTIFY
+            | XCB_EVENT_MASK_KEY_PRESS
+            | XCB_EVENT_MASK_EXPOSURE
+        };
+
+        cookie = xcb_change_window_attributes_checked(
+            ctx->xcon,
+            ctx->screen->root,
+            XCB_CW_EVENT_MASK,
+            values);
+        if((err = xcb_request_check(ctx->xcon, cookie))) {
+            if(err->error_code == XCB_ACCESS) {
+                fprintf(stderr, "failed to register for events. denied access. \
+maybe another window manager is running?\n");
+            } else {
+                fprintf(
+                    stderr,
+                    "failed to register for events. error code %d\n",
+                    err->error_code);
+            }
+            free(err);
+            xcb_disconnect(ctx->xcon);
+            exit(1);
+        }
+    }
+
+    xcb_flush(ctx->xcon);
+
+    /* keysym to keycode
+    for(int keycode = x->minKeycode; keycode <= x->maxKeycode; keycode++) {
+        if(XConnection_keycodeToKeysym(x, keycode) == keysym) {
+            return keycode;
+        }
+    }
+    return 0;
+    */
+}
+
+void destroyCtx(WMCtx* ctx)
+{
+    Decoration_destroy(&ctx->testDecor, ctx->xcon);
+    Font_destroy(&ctx->font, ctx->xcon);
+    xcb_free_cursor(ctx->xcon, ctx->cursor);
+    xcb_close_font(ctx->xcon, ctx->cursorFont);
+    xcb_disconnect(ctx->xcon);
+    free(ctx->keymap);
+}
+
+void eventHandler(WMCtx* ctx, xcb_generic_event_t* event)
+{
+    unsigned char eventCode;
+    void (*handlerFunc)(WMCtx*, xcb_generic_event_t*);
+
+    eventCode = event->response_type & ~0x80;
+    if(eventCode > MAX_EVENT_CODE)
+    {
+        fprintf(stderr, "received event code greater than MAX_EVENT_CODE");
+        eventCode = 0;
+    }
+    handlerFunc = eventHandlers[eventCode];
+    if(handlerFunc)
+        handlerFunc(ctx, event);
 }
 
 int main()
 {
-    XConnection x;
-    XCursor cursor;
-    xcb_keycode_t keycode;
-    int luaError;
+    WMCtx ctx;
+    xcb_generic_event_t* event;
+    int conErr;
 
-    luaState = luaL_newstate();
-    luaL_openlibs(luaState);
-    lua_register(luaState, "spawn", l_spawn);
-    luaError = luaL_dofile(luaState, "mwmrc.lua");
-    if(luaError != LUA_OK) {
-        fprintf(stderr, "[LUA ERROR]: %s\n", lua_tostring(luaState, -1));
-        lua_pop(luaState, 1);
-    }
+    initCtx(&ctx);
 
-    XConnection_init(&x);
-
-    xcb_ungrab_key(x.con, XCB_GRAB_ANY, x.screen->root, XCB_MOD_MASK_ANY);
+    xcb_ungrab_key(ctx.xcon, XCB_GRAB_ANY, ctx.screen->root, XCB_MOD_MASK_ANY);
     xcb_grab_key(
-        x.con,
+        ctx.xcon,
         1,
-        x.screen->root,
+        ctx.screen->root,
         XCB_MOD_MASK_1,
         XCB_GRAB_ANY,
         XCB_GRAB_MODE_ASYNC,
         XCB_GRAB_MODE_ASYNC);
 
-    XCursor_init(&cursor, &x);
-
-    /* DECORATION */
-    Font_init(&font, x.con, "fixed");
-    Decoration_init(&testDecoration, x.con, x.screen, 400, 600, 800, 200);
-    Decoration_drawRect(&testDecoration, x.con, 0, 0, 800, 200, x.screen->white_pixel);
-    Decoration_drawText(
-        &testDecoration,
-        x.con,
-        0, 0,
-        "Hiy AAAAAAA",
-        &font,
-        x.screen->white_pixel,
-        x.screen->black_pixel);
-
-    /* WINDOW ATTRIBS */
-    uint32_t values[] = {
-        XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT
-        | XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY
-        | XCB_EVENT_MASK_STRUCTURE_NOTIFY
-        | XCB_EVENT_MASK_KEY_PRESS
-        | XCB_EVENT_MASK_EXPOSURE
-    };
-    xcb_void_cookie_t cookie;
-    cookie = xcb_change_window_attributes_checked(
-        x.con,
-        x.screen->root,
-        XCB_CW_EVENT_MASK,
-        values);
-    xcb_generic_error_t* err;
-    if((err = xcb_request_check(x.con, cookie))) {
-        if(err->error_code == XCB_ACCESS) {
-            fprintf(stderr, "failed to register for events. denied access. \
-maybe another window manager is running?\n");
-        } else {
-            fprintf(
-                stderr,
-                "failed to register for events. error code %d\n",
-                err->error_code);
-        }
-        free(err);
-        xcb_disconnect(x.con);
-        exit(1);
-    }
-    xcb_flush(x.con);
-
-    /* EVENT LOOP */
-    while(quit == 0) {
-        int conErr;
-        if((conErr = xcb_connection_has_error(x.con))) {
+    while(ctx.quit == 0) {
+        if((conErr = xcb_connection_has_error(ctx.xcon))) {
             fprintf(
                 stderr,
                 "x server connection unexpectedly closed. error code %d\n",
                 conErr);
             exit(1);
         }
-        xcb_generic_event_t* event = xcb_wait_for_event(x.con);
-
-        unsigned char eventCode = event->response_type & ~0x80;
-        if(eventCode > MAX_EVENT_CODE)
-        {
-            fprintf(stderr, "received event code greater than MAX_EVENT_CODE");
-            eventCode = 0;
-        }
-        void (*handlerFunc)(XConnection*, xcb_generic_event_t*) = eventHandlers[eventCode];
-        if(handlerFunc)
-            handlerFunc(&x, event);
+        event = xcb_wait_for_event(ctx.xcon);
+        eventHandler(&ctx, event);
     }
 
-    /* CLEANUP */
-    XCursor_destroy(&cursor, &x);
-    XConnection_destroy(&x);
-
-    lua_close(luaState);
+    destroyCtx(&ctx);
 
     return 0;
 }
